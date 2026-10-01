@@ -106,7 +106,7 @@ func FuzzBuilder(f *testing.F) {
 		}
 		for _, r := range want {
 			for _, s := range []uint64{r.lo - 1, r.lo, r.hi, r.hi + 1} {
-				if got := revokesSerial(k.certs[string(ca.PublicKey().Marshal())].serials, s); got != in(s) {
+				if got := k.certs[string(ca.PublicKey().Marshal())].revokesSerial(s); got != in(s) {
 					t.Fatalf("serial %d: revoked = %v, want %v", s, got, in(s))
 				}
 			}
