@@ -44,6 +44,9 @@ lanes, `ssh-keygen` is the oracle (a missing one fails those lanes):
 | `TestOracleMutations` | every truncation and ~1400 single-byte corruptions of a KRL: `Parse` refuses exactly what `ssh-keygen` refuses, and answers like it for the rest |
 | `TestOracleSigned` | a KRL with a signature section: read, signature skipped |
 | `TestOracleBitmapOverflow` | see below |
+| `TestOracleExpiresIsLoadedBySshKeygen` | a KRL carrying the expiry extension (below) loads and revokes as before; the control, the same section marked critical, is refused |
+| `TestOracleMergeIsTheUnion` | three lists written by `ssh-keygen -k` (every serial encoding, key IDs, "any CA", explicit keys, SHA1 and SHA256 fingerprints), merged by `Builder.Merge`: the merged list revokes exactly what one of them revokes, for ~180 certificates and keys |
+| `TestOracleRevokingTheCARevokesEveryCertificate` | a KRL naming the CA's own key revokes every certificate it signed, and nothing else |
 
 Windows runs the pure-Go tests only, which alone cover 100% of the code.
 `FuzzParse` (seeded with KRLs written by ssh-keygen, in `testdata/`) and
@@ -56,6 +59,29 @@ writes a bitmap wider than its own reader accepts and then refuses its own
 file: `Invalid KRL file: bignum is too large` (OpenSSH 10.3p1). `Parse` refuses
 that file too, as sshd would. `Builder` starts a new section before a bitmap
 gets that wide, so what it writes is always readable.
+
+## An expiry: `expires@go-authn.github.io`
+
+A KRL has a generation date and a version, but nothing says when it stops
+being current, so a stale copy is indistinguishable from a fresh one: what
+TUF calls a freeze attack, and what a CRL's `nextUpdate` (RFC 5280, 5.1.2.5)
+prevents. `Builder.SetExpires` writes that time in an extension section,
+named `name@domain` as PROTOCOL.krl section 5 recommends and **not critical**,
+so `sshd` and `ssh-keygen` load the list and ignore it (judged above). `Parse`
+reads it into `KRL.Expires`, and refuses a malformed or repeated one: read as
+absent, it would turn a list meant to lapse into one that never does.
+
+The expiry is only as good as the list's authenticity: sign the list.
+
+## Merging lists: one file for sshd
+
+`sshd` read a single `RevokedKeys` file until OpenSSH 10.3 (Debian 13 ships
+10.0, Ubuntu 24.04 9.6), so a server trusting several CAs needs their lists in
+one. `Builder.Merge` adds every revocation of a parsed list (serials, key IDs,
+explicit keys, SHA1 and SHA256 fingerprints, under the same CAs) to the list
+being built; the header is the Builder's own. Merging the same lists in the
+same order writes the same bytes. A bitmap is read back as ranges, so a merge
+is bounded (4M ranges) against an alternating one.
 
 ## No signatures
 
