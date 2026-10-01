@@ -420,7 +420,12 @@ func (k *KRL) certRevoked(cert *ssh.Certificate, rc *certRevocations) bool {
 	}
 	// No range holds serial 0 (Parse refuses it), so a certificate without a
 	// serial is never revoked by serial, as in krl.c.
-	return revokesSerial(rc.serials, cert.Serial) || revokesBitmap(rc.bitmaps, cert.Serial)
+	return rc.revokesSerial(cert.Serial)
+}
+
+// revokesSerial reports whether serial is revoked by a range or a bitmap.
+func (rc *certRevocations) revokesSerial(serial uint64) bool {
+	return revokesSerial(rc.serials, serial) || revokesBitmap(rc.bitmaps, serial)
 }
 
 func has(m map[string]struct{}, k string) bool {
