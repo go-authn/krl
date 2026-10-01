@@ -62,7 +62,24 @@ type KRL struct {
 // certRevocations is what one certificate section says about one CA.
 type certRevocations struct {
 	serials []serialRange // sorted, disjoint, never adjacent once parsed
+	bitmaps []bitmapSpan  // sorted, disjoint once parsed
 	ids     map[string]struct{}
+}
+
+// bitmapSpan is a serial bitmap kept as one: bit n of words (little-endian,
+// 64 to a word) is serial lo+n, for serials lo through hi. Turning each run
+// of set bits into a serialRange instead costs 16 bytes per run, which an
+// alternating bitmap makes one run per two bits: 64 times the input.
+type bitmapSpan struct {
+	lo, hi uint64
+	words  []uint64
+}
+
+func (b *bitmapSpan) set(n uint64) { b.words[n/64] |= 1 << (n % 64) }
+
+func (b *bitmapSpan) has(s uint64) bool {
+	n := s - b.lo
+	return b.words[n/64]&(1<<(n%64)) != 0
 }
 
 // serialRange is an inclusive range of certificate serials; lo is never 0.
@@ -131,6 +148,7 @@ func Parse(b []byte) (*KRL, error) {
 	}
 	for _, c := range k.certs {
 		c.serials = mergeRanges(c.serials)
+		c.bitmaps = mergeBitmaps(c.bitmaps)
 	}
 	return k, nil
 }
@@ -232,7 +250,7 @@ func (rc *certRevocations) add(r *reader, lo, hi uint64) {
 }
 
 // addBitmap records the serials offset+N for every bit N set in bitmap, a
-// big-endian magnitude.
+// big-endian magnitude, as a bitmapSpan.
 func (rc *certRevocations) addBitmap(r *reader, offset uint64, bitmap []byte) {
 	if r.err != nil || len(bitmap) == 0 {
 		return
@@ -244,23 +262,72 @@ func (rc *certRevocations) addBitmap(r *reader, offset uint64, bitmap []byte) {
 		r.fail("serial bitmap wraps past 2^64-1")
 		return
 	}
-	var run *serialRange
-	for n := range nbits {
-		if bitmap[len(bitmap)-1-int(n/8)]&(1<<(n%8)) == 0 {
-			run = nil
-			continue
-		}
-		s := offset + n
-		if run != nil {
-			run.hi = s
-			continue
-		}
-		rc.add(r, s, s)
-		if r.err != nil {
-			return
-		}
-		run = &rc.serials[len(rc.serials)-1]
+	// Bit 0 at offset 0 is serial 0, which krl.c refuses.
+	if offset == 0 && bitmap[len(bitmap)-1]&1 != 0 {
+		rc.add(r, 0, 0)
+		return
 	}
+	span := bitmapSpan{lo: offset, hi: offset + nbits - 1, words: make([]uint64, (nbits+63)/64)}
+	for i, by := range slices.Backward(bitmap) {
+		for bit := range 8 {
+			if by&(1<<bit) != 0 {
+				span.set(uint64(len(bitmap)-1-i)*8 + uint64(bit))
+			}
+		}
+	}
+	rc.bitmaps = append(rc.bitmaps, span)
+}
+
+// mergeBitmaps sorts spans and ORs together those that overlap, so that a
+// serial is in at most one of them. The words of the result are no more than
+// those of the input, however the spans overlap.
+func mergeBitmaps(bs []bitmapSpan) []bitmapSpan {
+	slices.SortFunc(bs, func(a, b bitmapSpan) int {
+		switch {
+		case a.lo < b.lo:
+			return -1
+		case a.lo > b.lo:
+			return 1
+		}
+		return 0
+	})
+	out := bs[:0]
+	for _, b := range bs {
+		n := len(out)
+		if n == 0 || b.lo > out[n-1].hi {
+			out = append(out, b)
+			continue
+		}
+		cur := &out[n-1]
+		if b.hi > cur.hi {
+			cur.hi = b.hi
+			cur.words = append(cur.words, make([]uint64, (cur.hi-cur.lo)/64+1-uint64(len(cur.words)))...)
+		}
+		shift := b.lo - cur.lo
+		for i, w := range b.words {
+			pos := shift + uint64(i)*64
+			cur.words[pos/64] |= w << (pos % 64)
+			if rest := w >> (64 - pos%64); pos%64 != 0 && rest != 0 {
+				cur.words[pos/64+1] |= rest
+			}
+		}
+	}
+	return out
+}
+
+// revokesBitmap reports whether serial is set in bs, which mergeBitmaps has
+// sorted.
+func revokesBitmap(bs []bitmapSpan, serial uint64) bool {
+	i, found := slices.BinarySearchFunc(bs, serial, func(b bitmapSpan, s uint64) int {
+		switch {
+		case b.hi < s:
+			return -1
+		case b.lo > s:
+			return 1
+		}
+		return 0
+	})
+	return found && bs[i].has(serial)
 }
 
 // mergeRanges sorts ranges and joins those that overlap or touch, as
@@ -353,7 +420,7 @@ func (k *KRL) certRevoked(cert *ssh.Certificate, rc *certRevocations) bool {
 	}
 	// No range holds serial 0 (Parse refuses it), so a certificate without a
 	// serial is never revoked by serial, as in krl.c.
-	return revokesSerial(rc.serials, cert.Serial)
+	return revokesSerial(rc.serials, cert.Serial) || revokesBitmap(rc.bitmaps, cert.Serial)
 }
 
 func has(m map[string]struct{}, k string) bool {
