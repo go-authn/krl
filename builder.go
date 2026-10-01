@@ -22,6 +22,7 @@ type Builder struct {
 	comment string
 	cas     []*builderCA // in the order first named, as krl.c keeps them
 	keys    map[string]struct{}
+	expires time.Time
 	err     error
 }
 
@@ -143,7 +144,27 @@ func (b *Builder) Marshal(now time.Time) ([]byte, error) {
 		w.u8(sectionExplicitKey)
 		w.str(s.b)
 	}
+	if !b.expires.IsZero() {
+		if !b.expires.After(now) {
+			return nil, errors.New("krl: the list would expire before it was generated")
+		}
+		v := &writer{}
+		v.u64(uint64(b.expires.Unix()))
+		e := &writer{}
+		e.str([]byte(ExtensionExpires))
+		e.u8(0) // not critical: sshd loads the list and ignores it
+		e.str(v.b)
+		w.u8(sectionExtension)
+		w.str(e.b)
+	}
 	return w.b, nil
+}
+
+// SetExpires records t, in the ExtensionExpires extension, as the time
+// after which the list is no longer current. Zero, the default, writes no
+// expiry. t is kept to the second.
+func (b *Builder) SetExpires(t time.Time) {
+	b.expires = t.Truncate(time.Second)
 }
 
 func sortedKeys(m map[string]struct{}) []string {

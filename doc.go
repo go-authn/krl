@@ -34,6 +34,14 @@
 // too large"), which is what happens to many sparse serials close together.
 // Builder starts a new section instead.
 //
+// # Expiry
+//
+// Builder.SetExpires writes, in a non-critical extension section named
+// ExtensionExpires, the time after which the list is no longer current;
+// Parse reads it into KRL.Expires. sshd ignores it. It is what lets a
+// reader tell a stale copy from a current one, once the list itself is
+// authenticated.
+//
 // # Integrity: no signatures
 //
 // The format once had a signature section. OpenSSH never exposed a way to

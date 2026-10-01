@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"slices"
 	"time"
@@ -49,6 +50,11 @@ type KRL struct {
 	Flags uint64
 	// Comment is the free-form comment of the header.
 	Comment string
+	// Expires is when the list stops being current, from the
+	// ExtensionExpires extension; zero when the list does not say. sshd
+	// ignores it -- the extension is not critical -- and a verifier that
+	// enforces freshness reads it here.
+	Expires time.Time
 	// Signed reports that the list carried a signature section. The
 	// signature is skipped, never verified: see the package documentation.
 	Signed bool
@@ -130,7 +136,7 @@ func Parse(b []byte) (*KRL, error) {
 		case sectionFingerprintSHA256:
 			blobSection(sect, k.sha256s, sha256.Size)
 		case sectionExtension:
-			extension(sect, "section")
+			k.extension(sect, "section")
 		case sectionSignature:
 			// Two strings: the signing key, read above, and the
 			// signature. krl.c skips both.
@@ -165,19 +171,48 @@ func blobSection(r *reader, into map[string]struct{}, want int) {
 }
 
 // extension reads an extension section or subsection and refuses it when
-// it is critical: this implementation, like OpenSSH, knows none.
-func extension(r *reader, what string) {
+// it is critical: this implementation, like OpenSSH, knows none. k is nil
+// for a subsection; a section may be ExtensionExpires, read into k.Expires.
+func (k *KRL) extension(r *reader, what string) {
 	name := r.cstr()
 	critical := r.u8()
-	r.str()
+	body := r.str()
 	switch {
 	case r.err != nil:
 	case len(r.b) != 0:
 		r.fail("trailing data in extension " + what)
 	case critical != 0:
 		r.fail(fmt.Sprintf("unsupported critical extension %s %q", what, name))
+	case k != nil && name == ExtensionExpires:
+		// Ours, so held to its format: a malformed or repeated expiry
+		// read as "no expiry" would turn a list meant to lapse into one
+		// that never does.
+		v := &reader{b: body}
+		t := v.u64()
+		switch {
+		case v.err != nil || len(v.b) != 0:
+			r.fail(ExtensionExpires + " is not one uint64")
+		case !k.Expires.IsZero():
+			r.fail(ExtensionExpires + " appears twice")
+		case t == 0 || t > math.MaxInt64:
+			r.fail(ExtensionExpires + " is out of range")
+		default:
+			k.Expires = time.Unix(int64(t), 0).UTC()
+		}
 	}
 }
+
+// ExtensionExpires names a KRL extension section carrying, as a uint64 of
+// seconds since 1970-01-01 UTC, the time after which the list is no longer
+// current -- what a CRL's nextUpdate is (RFC 5280, 5.1.2.5). It is written
+// not critical, so sshd, which knows no extension, loads the list and
+// ignores it; PROTOCOL.krl section 5 recommends the name@domain form.
+//
+// It says nothing unless the list is authenticated: a list fetched over a
+// channel anyone can write to carries whatever expiry the writer chose.
+// Sign the list (SSHSIG, which PROTOCOL.krl recommends over its own
+// signature section) and check both.
+const ExtensionExpires = "expires@go-authn.github.io"
 
 func (k *KRL) parseCertificates(r *reader) {
 	caBlob := r.str()
@@ -225,7 +260,7 @@ func (k *KRL) parseCertificates(r *reader) {
 				}
 			}
 		case certExtension:
-			extension(sub, "subsection")
+			(*KRL)(nil).extension(sub, "subsection")
 		default:
 			sub.fail(fmt.Sprintf("unsupported certificate subsection type %#x", typ))
 		}
