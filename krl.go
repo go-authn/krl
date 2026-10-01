@@ -83,6 +83,35 @@ type bitmapSpan struct {
 
 func (b *bitmapSpan) set(n uint64) { b.words[n/64] |= 1 << (n % 64) }
 
+// runs calls f for each run of consecutive set bits, as the serials lo..hi
+// it stands for, in increasing order.
+func (b *bitmapSpan) runs(f func(lo, hi uint64)) {
+	start, in := uint64(0), false
+	for i, w := range b.words {
+		base := uint64(i) * 64
+		for bit := uint64(0); bit < 64; {
+			if !in {
+				if w>>bit == 0 {
+					break // no set bit left in this word
+				}
+				bit += uint64(bits.TrailingZeros64(w >> bit))
+				start, in = base+bit, true
+				continue
+			}
+			ones := uint64(bits.TrailingZeros64(^(w >> bit)))
+			if ones == 0 {
+				f(b.lo+start, b.lo+base+bit-1)
+				in = false
+				continue
+			}
+			bit += ones // a run of 64-bit's ones ends past this word
+		}
+	}
+	if in {
+		f(b.lo+start, b.lo+uint64(len(b.words))*64-1)
+	}
+}
+
 func (b *bitmapSpan) has(s uint64) bool {
 	n := s - b.lo
 	return b.words[n/64]&(1<<(n%64)) != 0

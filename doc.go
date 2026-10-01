@@ -42,6 +42,11 @@
 // reader tell a stale copy from a current one, once the list itself is
 // authenticated.
 //
+// # Merging
+//
+// Builder.Merge adds every revocation of a parsed KRL to the list being
+// built, for a reader that takes one file: sshd before OpenSSH 10.3.
+//
 // # Integrity: no signatures
 //
 // The format once had a signature section. OpenSSH never exposed a way to

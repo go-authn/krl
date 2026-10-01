@@ -22,6 +22,9 @@ type Builder struct {
 	comment string
 	cas     []*builderCA // in the order first named, as krl.c keeps them
 	keys    map[string]struct{}
+	sha1s   map[string]struct{}
+	sha256s map[string]struct{}
+	ranges  int // serial ranges held, bounded by maxMergedRanges
 	expires time.Time
 	err     error
 }
@@ -34,7 +37,8 @@ type builderCA struct {
 
 // NewBuilder returns a Builder for a KRL with this krl_version and comment.
 func NewBuilder(version uint64, comment string) *Builder {
-	return &Builder{version: version, comment: comment, keys: map[string]struct{}{}}
+	return &Builder{version: version, comment: comment, keys: map[string]struct{}{},
+		sha1s: map[string]struct{}{}, sha256s: map[string]struct{}{}}
 }
 
 func (b *Builder) fail(err error) {
@@ -53,6 +57,11 @@ func (b *Builder) ca(ca ssh.PublicKey) *builderCA {
 		}
 		blob = ca.Marshal()
 	}
+	return b.caBlob(blob)
+}
+
+// caBlob is ca for a key already in wire form; nil is any CA.
+func (b *Builder) caBlob(blob []byte) *builderCA {
 	for _, c := range b.cas {
 		if bytes.Equal(c.blob, blob) {
 			return c
@@ -136,13 +145,21 @@ func (b *Builder) Marshal(now time.Time) ([]byte, error) {
 		w.u8(sectionCertificates)
 		w.str(c.section())
 	}
-	if len(b.keys) > 0 {
-		s := &writer{}
-		for _, k := range sortedKeys(b.keys) {
-			s.str([]byte(k))
+	// In krl.c's order: explicit keys, then SHA1, then SHA256
+	// fingerprints (ssh_krl_to_blob).
+	for _, s := range []struct {
+		typ byte
+		set map[string]struct{}
+	}{{sectionExplicitKey, b.keys}, {sectionFingerprintSHA1, b.sha1s}, {sectionFingerprintSHA256, b.sha256s}} {
+		if len(s.set) == 0 {
+			continue
 		}
-		w.u8(sectionExplicitKey)
-		w.str(s.b)
+		body := &writer{}
+		for _, k := range sortedKeys(s.set) {
+			body.str([]byte(k))
+		}
+		w.u8(s.typ)
+		w.str(body.b)
 	}
 	if !b.expires.IsZero() {
 		if !b.expires.After(now) {
@@ -316,4 +333,56 @@ func chooseNextState(current byte, contig uint64, final bool, lastGap, nextGap u
 		next, restart = certSerialBitmap, true
 	}
 	return next, restart
+}
+
+// maxMergedRanges bounds what Merge may hold: a bitmap is read back as one
+// range per run of set bits, 16 bytes each, and an alternating bitmap has a
+// run per two bits. 1<<22 ranges is 64 MiB, past any list of real
+// revocations.
+const maxMergedRanges = 1 << 22
+
+// Merge adds every revocation of k to the list being built: serials, key
+// IDs, explicit keys and SHA1 and SHA256 fingerprints, under the same CAs.
+// It is what serving several CAs' lists to a reader that takes one file
+// needs -- sshd before OpenSSH 10.3 reads a single RevokedKeys file. k's
+// header (version, date, comment, expiry) is not carried over: the merged
+// list has the Builder's own.
+func (b *Builder) Merge(k *KRL) {
+	if k == nil {
+		return
+	}
+	cas := make([]string, 0, len(k.certs))
+	for ca := range k.certs {
+		cas = append(cas, ca)
+	}
+	slices.Sort(cas) // a merge of the same lists writes the same bytes
+	for _, ca := range cas {
+		rc := k.certs[ca]
+		var blob []byte
+		if ca != "" {
+			blob = []byte(ca)
+		}
+		c := b.caBlob(blob)
+		add := func(lo, hi uint64) {
+			if b.ranges++; b.ranges > maxMergedRanges {
+				b.fail(errors.New("krl: merged lists hold more serial ranges than this builder keeps"))
+				return
+			}
+			c.serials = append(c.serials, serialRange{lo, hi})
+		}
+		for _, r := range rc.serials {
+			add(r.lo, r.hi)
+		}
+		for _, bm := range rc.bitmaps {
+			bm.runs(add)
+		}
+		for id := range rc.ids {
+			c.ids[id] = struct{}{}
+		}
+	}
+	for into, from := range map[*map[string]struct{}]map[string]struct{}{&b.keys: k.keys, &b.sha1s: k.sha1s, &b.sha256s: k.sha256s} {
+		for v := range from {
+			(*into)[v] = struct{}{}
+		}
+	}
 }
