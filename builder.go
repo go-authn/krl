@@ -4,6 +4,8 @@ package krl
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -366,14 +368,29 @@ func (b *Builder) Merge(k *KRL) {
 	}
 }
 
-// MergeCA adds only what k revokes among the certificates ca signed: the
-// serials and key IDs of k's section for ca. Everything else k holds -- a
-// section for another CA or for any CA, an explicit key, a fingerprint --
-// is left out, and counted in dropped. It is what a distributor merging
-// several CAs' lists needs when each list is trusted for its own CA only:
-// with Merge, CA A's list could revoke CA B's key, or every serial of
-// every CA, and lock B's users out.
-func (b *Builder) MergeCA(k *KRL, ca ssh.PublicKey) (dropped int) {
+// MergeCA adds what k says about the certificates ca signed, and about
+// keys, leaving out only what reaches another CA. Of k it keeps:
+//
+//   - its section for ca: serials and key IDs;
+//   - its sections for any CA, re-scoped to ca: serial N of any CA is, among
+//     other things, serial N of ca;
+//   - its explicit keys and SHA1 and SHA256 fingerprints -- a user key a
+//     CA revokes is revoked, and so is ca's own key, which revokes every
+//     certificate ca signed;
+//
+// and it leaves out, counting them in dropped: its sections for another
+// CA, and an explicit key or fingerprint that designates one of others --
+// the keys of the other CAs the merged list serves.
+//
+// It is what a distributor merging several CAs' lists into one needs: each
+// list keeps its full effect on its own CA's certificates, and none can
+// revoke another CA, or lock its users out, by naming that CA's key or its
+// serials.
+//
+// ⛔ v0.3.0's MergeCA dropped every explicit key and fingerprint, and the
+// any-CA sections: a CA revoking a compromised user key it had certified,
+// or its own key, revoked nothing once merged (found by a security audit).
+func (b *Builder) MergeCA(k *KRL, ca ssh.PublicKey, others ...ssh.PublicKey) (dropped int) {
 	if k == nil || ca == nil {
 		return 0
 	}
@@ -382,14 +399,48 @@ func (b *Builder) MergeCA(k *KRL, ca ssh.PublicKey) (dropped int) {
 		return 0
 	}
 	own := string(ca.Marshal())
-	for blob, rc := range k.certs {
-		if blob != own {
+	foreign := map[string]bool{}
+	foreignSHA1 := map[string]bool{}
+	foreignSHA256 := map[string]bool{}
+	for _, o := range others {
+		if o == nil {
+			continue
+		}
+		blob := o.Marshal()
+		if string(blob) == own {
+			continue // ca's own key is never "another CA"
+		}
+		foreign[string(blob)] = true
+		h1 := sha1.Sum(blob)
+		foreignSHA1[string(h1[:])] = true
+		h256 := sha256.Sum256(blob)
+		foreignSHA256[string(h256[:])] = true
+	}
+	blobs := make([]string, 0, len(k.certs))
+	for blob := range k.certs {
+		blobs = append(blobs, blob)
+	}
+	slices.Sort(blobs) // the same lists merge to the same bytes
+	for _, blob := range blobs {
+		if blob != own && blob != "" {
 			dropped++
 			continue
 		}
-		b.mergeCerts(rc, blob)
+		b.mergeCerts(k.certs[blob], own) // any CA ("") re-scoped to ca
 	}
-	return dropped + len(k.keys) + len(k.sha1s) + len(k.sha256s)
+	for _, s := range []struct {
+		into, from map[string]struct{}
+		foreign    map[string]bool
+	}{{b.keys, k.keys, foreign}, {b.sha1s, k.sha1s, foreignSHA1}, {b.sha256s, k.sha256s, foreignSHA256}} {
+		for v := range s.from {
+			if s.foreign[v] {
+				dropped++
+				continue
+			}
+			s.into[v] = struct{}{}
+		}
+	}
+	return dropped
 }
 
 // mergeCerts adds one certificate section, under the CA in wire form ("" is

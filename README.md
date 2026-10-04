@@ -83,11 +83,19 @@ being built; the header is the Builder's own. Merging the same lists in the
 same order writes the same bytes. A bitmap is read back as ranges, so a merge
 is bounded (4M ranges) against an alternating one.
 
-`Builder.MergeCA(k, ca)` merges only `k`'s revocations of certificates `ca`
-signed, and counts what it leaves out: a section for another CA or for any CA,
-an explicit key, a fingerprint. A distributor that trusts each CA's list for
-that CA alone uses it; with `Merge`, CA A's list could revoke CA B's key and
-lock B's users out.
+`Builder.MergeCA(k, ca, others...)` merges `k` for `ca`, the way a
+distributor merging several CAs' lists into one needs it:
+- **Kept:** `ca`'s section; any-CA sections, re-scoped to `ca`; and explicit
+  keys and fingerprints. A user key `ca` revokes stays revoked, and `ca`
+  revoking its own key revokes every certificate it signed.
+- **Left out, and counted:** sections for another CA, and keys or fingerprints
+  that designate one of `others`, the other CAs the merged list serves.
+
+So each list keeps its full effect on its own CA, and none can lock another
+CA's users out. v0.3.0 also dropped explicit keys, fingerprints and any-CA
+sections: a CA revoking a compromised user key, or itself, revoked nothing
+once merged. A security audit found it; ssh-keygen now judges both cases
+(`TestOracleMergeCA`, `TestOracleMergeCAKeepsACAsOwnKeyRevocations`).
 
 ## No signatures
 
