@@ -48,7 +48,9 @@ lanes, `ssh-keygen` is the oracle (a missing one fails those lanes):
 | `TestOracleMergeIsTheUnion` | three lists written by `ssh-keygen -k` (every serial encoding, key IDs, "any CA", explicit keys, SHA1 and SHA256 fingerprints), merged by `Builder.Merge`: the merged list revokes exactly what one of them revokes, for ~180 certificates and keys |
 | `TestOracleRevokingTheCARevokesEveryCertificate` | a KRL naming the CA's own key revokes every certificate it signed, and nothing else |
 
-Windows runs the pure-Go tests only, which alone cover 100% of the code.
+Windows runs the pure-Go tests only. The 100% coverage gate is measured on
+the Linux lane, where ssh-keygen is there: without it the pure-Go tests leave
+part of `Builder.Merge` and `Builder.MergeCA` to the oracle tests.
 `FuzzParse` (seeded with KRLs written by ssh-keygen, in `testdata/`) and
 `FuzzBuilder` run on CI too.
 
