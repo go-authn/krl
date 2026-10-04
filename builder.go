@@ -357,32 +357,63 @@ func (b *Builder) Merge(k *KRL) {
 	}
 	slices.Sort(cas) // a merge of the same lists writes the same bytes
 	for _, ca := range cas {
-		rc := k.certs[ca]
-		var blob []byte
-		if ca != "" {
-			blob = []byte(ca)
-		}
-		c := b.caBlob(blob)
-		add := func(lo, hi uint64) {
-			if b.ranges++; b.ranges > maxMergedRanges {
-				b.fail(errors.New("krl: merged lists hold more serial ranges than this builder keeps"))
-				return
-			}
-			c.serials = append(c.serials, serialRange{lo, hi})
-		}
-		for _, r := range rc.serials {
-			add(r.lo, r.hi)
-		}
-		for _, bm := range rc.bitmaps {
-			bm.runs(add)
-		}
-		for id := range rc.ids {
-			c.ids[id] = struct{}{}
-		}
+		b.mergeCerts(k.certs[ca], ca)
 	}
 	for into, from := range map[*map[string]struct{}]map[string]struct{}{&b.keys: k.keys, &b.sha1s: k.sha1s, &b.sha256s: k.sha256s} {
 		for v := range from {
 			(*into)[v] = struct{}{}
 		}
+	}
+}
+
+// MergeCA adds only what k revokes among the certificates ca signed: the
+// serials and key IDs of k's section for ca. Everything else k holds -- a
+// section for another CA or for any CA, an explicit key, a fingerprint --
+// is left out, and counted in dropped. It is what a distributor merging
+// several CAs' lists needs when each list is trusted for its own CA only:
+// with Merge, CA A's list could revoke CA B's key, or every serial of
+// every CA, and lock B's users out.
+func (b *Builder) MergeCA(k *KRL, ca ssh.PublicKey) (dropped int) {
+	if k == nil || ca == nil {
+		return 0
+	}
+	if _, isCert := ca.(*ssh.Certificate); isCert {
+		b.fail(errors.New("krl: a CA key must be a plain key, not a certificate"))
+		return 0
+	}
+	own := string(ca.Marshal())
+	for blob, rc := range k.certs {
+		if blob != own {
+			dropped++
+			continue
+		}
+		b.mergeCerts(rc, blob)
+	}
+	return dropped + len(k.keys) + len(k.sha1s) + len(k.sha256s)
+}
+
+// mergeCerts adds one certificate section, under the CA in wire form ("" is
+// any CA).
+func (b *Builder) mergeCerts(rc *certRevocations, ca string) {
+	var blob []byte
+	if ca != "" {
+		blob = []byte(ca)
+	}
+	c := b.caBlob(blob)
+	add := func(lo, hi uint64) {
+		if b.ranges++; b.ranges > maxMergedRanges {
+			b.fail(errors.New("krl: merged lists hold more serial ranges than this builder keeps"))
+			return
+		}
+		c.serials = append(c.serials, serialRange{lo, hi})
+	}
+	for _, r := range rc.serials {
+		add(r.lo, r.hi)
+	}
+	for _, bm := range rc.bitmaps {
+		bm.runs(add)
+	}
+	for id := range rc.ids {
+		c.ids[id] = struct{}{}
 	}
 }

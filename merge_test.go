@@ -194,3 +194,77 @@ func TestMergeIsBounded(t *testing.T) {
 	}
 	b.Merge(nil) // nothing to add
 }
+
+// One CA's list, merged for that CA only: what it revokes among its own
+// certificates stays, and nothing it says about another CA, any CA, or a
+// key does. Judged by ssh-keygen; the control is Merge, which keeps it all.
+func TestOracleMergeCAKeepsOnlyItsOwnCertificates(t *testing.T) {
+	o := newOracle(t)
+	caA := o.keygen("caA", "-t", "ed25519")
+	caB := o.keygen("caB", "-t", "ed25519")
+	u := o.keygen("u", "-t", "ed25519")
+	// A's list reaches past A: B's serial 5, any CA's serial 6, B's key,
+	// a user key by fingerprint.
+	o.write("own", []byte("serial: 1\nid: alice\n"))
+	o.mustRun("-k", "-f", "a.krl", "-s", caA, "own")
+	o.write("b", []byte("serial: 5\n"))
+	o.mustRun("-k", "-u", "-f", "a.krl", "-s", caB, "b")
+	o.write("any", []byte("serial: 6\n"))
+	o.mustRun("-k", "-u", "-f", "a.krl", "-s", "none", "any")
+	o.write("keys", []byte("key: "+string(o.read(caB))+"sha256: "+string(o.read(u))))
+	o.mustRun("-k", "-u", "-f", "a.krl", "keys")
+	k, err := Parse(o.read("a.krl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []string{
+		o.sign("caA", u, "x", 1), o.sign("caA", u, "alice", 0), o.sign("caA", u, "x", 2), // A: revoked, revoked, not
+		o.sign("caB", u, "x", 5), o.sign("caB", u, "x", 6), o.sign("caB", u, "x", 7), // B: none of A's business
+		caB, u,
+	}
+	want := map[string][]bool{
+		"MergeCA": {true, true, false, false, false, false, false, false},
+		// The control: every certificate here is of key u, which the list
+		// revokes by fingerprint, and B's key is revoked outright.
+		"Merge": {true, true, true, true, true, true, true, true},
+	}
+	for name, merge := range map[string]func(*Builder) int{
+		"MergeCA": func(b *Builder) int { return b.MergeCA(k, o.pub(caA)) },
+		"Merge":   func(b *Builder) int { b.Merge(k); return 0 },
+	} {
+		b := NewBuilder(1, "")
+		dropped := merge(b)
+		data, err := b.Marshal(time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.write(name+".krl", data)
+		got, ok := o.query(name+".krl", files)
+		if !ok {
+			t.Fatalf("%s: ssh-keygen refuses the list", name)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want[name]) {
+			t.Errorf("%s: ssh-keygen -Q says %v, want %v", name, got, want[name])
+		}
+		if name == "MergeCA" && dropped != 4 {
+			t.Errorf("MergeCA dropped %d, want 4 (B's section, any-CA's, a key, a fingerprint)", dropped)
+		}
+		o.judge(name+".krl", files)
+	}
+}
+
+func TestMergeCARefusals(t *testing.T) {
+	ca := newGoCA(t)
+	b := NewBuilder(1, "")
+	if n := b.MergeCA(nil, ca.signer.PublicKey()); n != 0 {
+		t.Error(n)
+	}
+	k, _ := Parse(func() []byte { d, _ := NewBuilder(1, "").Marshal(time.Now()); return d }())
+	if n := b.MergeCA(k, nil); n != 0 {
+		t.Error(n)
+	}
+	b.MergeCA(k, ca.cert(t, 1, "x"))
+	if _, err := b.Marshal(time.Now()); err == nil {
+		t.Error("a certificate as the CA: no error")
+	}
+}

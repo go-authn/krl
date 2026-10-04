@@ -83,6 +83,12 @@ being built; the header is the Builder's own. Merging the same lists in the
 same order writes the same bytes. A bitmap is read back as ranges, so a merge
 is bounded (4M ranges) against an alternating one.
 
+`Builder.MergeCA(k, ca)` merges only `k`'s revocations of certificates `ca`
+signed, and counts what it leaves out: a section for another CA or for any CA,
+an explicit key, a fingerprint. A distributor that trusts each CA's list for
+that CA alone uses it; with `Merge`, CA A's list could revoke CA B's key and
+lock B's users out.
+
 ## No signatures
 
 OpenSSH never exposed a way to write the KRL signature section and no longer
