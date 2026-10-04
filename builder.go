@@ -387,10 +387,41 @@ func (b *Builder) Merge(k *KRL) {
 // revoke another CA, or lock its users out, by naming that CA's key or its
 // serials.
 //
+// What it does not stop is a list naming the public key of a user another
+// CA certified: sshd refuses that user's certificate, whoever signed it. A
+// distributor that does not trust a list with that merges it with
+// MergeCAWith and MergeOptions.DropKeys.
+//
 // ⛔ v0.3.0's MergeCA dropped every explicit key and fingerprint, and the
 // any-CA sections: a CA revoking a compromised user key it had certified,
 // or its own key, revoked nothing once merged (found by a security audit).
 func (b *Builder) MergeCA(k *KRL, ca ssh.PublicKey, others ...ssh.PublicKey) (dropped int) {
+	return b.MergeCAWith(k, ca, MergeOptions{Others: others})
+}
+
+// MergeOptions says what MergeCAWith leaves out of a list besides what
+// MergeCA does.
+type MergeOptions struct {
+	// Others are the keys of the other CAs the merged list serves, as
+	// MergeCA's others: their sections, and an explicit key or fingerprint
+	// that designates one of them, are left out.
+	Others []ssh.PublicKey
+	// DropKeys leaves out every explicit key and fingerprint except those
+	// designating ca itself. A revoked plain key cannot be scoped to one
+	// CA: sshd checks a certificate's own public key against the list,
+	// whoever signed the certificate, so a key one CA's list names locks
+	// out that key's holder under every CA the merged list serves. A
+	// distributor sets it for a list it does not trust with that; ca
+	// revoking its own key, which reaches only the certificates ca signed,
+	// is kept.
+	DropKeys bool
+}
+
+// MergeCAWith is MergeCA with options; MergeCAWith(k, ca,
+// MergeOptions{Others: others}) is MergeCA(k, ca, others...). What it leaves
+// out is counted in dropped.
+func (b *Builder) MergeCAWith(k *KRL, ca ssh.PublicKey, opt MergeOptions) (dropped int) {
+	others := opt.Others
 	if k == nil || ca == nil {
 		return 0
 	}
@@ -416,6 +447,8 @@ func (b *Builder) MergeCA(k *KRL, ca ssh.PublicKey, others ...ssh.PublicKey) (dr
 		h256 := sha256.Sum256(blob)
 		foreignSHA256[string(h256[:])] = true
 	}
+	h1, h256 := sha1.Sum([]byte(own)), sha256.Sum256([]byte(own))
+	ownIn := []string{own, string(h1[:]), string(h256[:])}
 	blobs := make([]string, 0, len(k.certs))
 	for blob := range k.certs {
 		blobs = append(blobs, blob)
@@ -428,12 +461,12 @@ func (b *Builder) MergeCA(k *KRL, ca ssh.PublicKey, others ...ssh.PublicKey) (dr
 		}
 		b.mergeCerts(k.certs[blob], own) // any CA ("") re-scoped to ca
 	}
-	for _, s := range []struct {
+	for i, s := range []struct {
 		into, from map[string]struct{}
 		foreign    map[string]bool
 	}{{b.keys, k.keys, foreign}, {b.sha1s, k.sha1s, foreignSHA1}, {b.sha256s, k.sha256s, foreignSHA256}} {
 		for v := range s.from {
-			if s.foreign[v] {
+			if s.foreign[v] || (opt.DropKeys && v != ownIn[i]) {
 				dropped++
 				continue
 			}
