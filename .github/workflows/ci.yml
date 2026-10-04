@@ -16,7 +16,9 @@ env:
   # The judge is OpenSSH's ssh-keygen (ubuntu and macOS runners ship it).
   # With this set, a lane where it is missing FAILS the oracle tests instead
   # of skipping them. Windows skips them by design (see oracle_test.go) and
-  # runs the pure-Go tests, which alone reach 100% coverage.
+  # runs the pure-Go tests, which alone do NOT reach 100% (95.6% measured
+  # without ssh-keygen: Merge 90.9%, MergeCA 52.8%); the coverage gate runs
+  # on ubuntu, with ssh-keygen.
   KRL_REQUIRE_SSHKEYGEN: "1"
 
 jobs:
