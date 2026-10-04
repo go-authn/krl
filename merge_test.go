@@ -195,61 +195,106 @@ func TestMergeIsBounded(t *testing.T) {
 	b.Merge(nil) // nothing to add
 }
 
-// One CA's list, merged for that CA only: what it revokes among its own
-// certificates stays, and nothing it says about another CA, any CA, or a
-// key does. Judged by ssh-keygen; the control is Merge, which keeps it all.
-func TestOracleMergeCAKeepsOnlyItsOwnCertificates(t *testing.T) {
+// One CA's list, merged for that CA: everything it says about its own
+// certificates and about keys keeps its effect; what it says about another
+// CA -- that CA's section, that CA's key, by blob or fingerprint -- does
+// not. Judged by ssh-keygen -Q on both sides: A's own list, and the merge.
+func TestOracleMergeCA(t *testing.T) {
 	o := newOracle(t)
 	caA := o.keygen("caA", "-t", "ed25519")
 	caB := o.keygen("caB", "-t", "ed25519")
-	u := o.keygen("u", "-t", "ed25519")
-	// A's list reaches past A: B's serial 5, any CA's serial 6, B's key,
-	// a user key by fingerprint.
+	u := o.keygen("u", "-t", "ed25519") // a user key A revokes by fingerprint
+	v := o.keygen("v", "-t", "ed25519") // a user key A revokes outright
+	w := o.keygen("w", "-t", "ed25519") // a user key nobody revokes
 	o.write("own", []byte("serial: 1\nid: alice\n"))
 	o.mustRun("-k", "-f", "a.krl", "-s", caA, "own")
 	o.write("b", []byte("serial: 5\n"))
 	o.mustRun("-k", "-u", "-f", "a.krl", "-s", caB, "b")
 	o.write("any", []byte("serial: 6\n"))
 	o.mustRun("-k", "-u", "-f", "a.krl", "-s", "none", "any")
-	o.write("keys", []byte("key: "+string(o.read(caB))+"sha256: "+string(o.read(u))))
+	o.write("keys", []byte("sha256: "+string(o.read(u))+"key: "+string(o.read(v))+"key: "+string(o.read(caB))+"sha1: "+string(o.read(caB))))
 	o.mustRun("-k", "-u", "-f", "a.krl", "keys")
 	k, err := Parse(o.read("a.krl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	files := []string{
-		o.sign("caA", u, "x", 1), o.sign("caA", u, "alice", 0), o.sign("caA", u, "x", 2), // A: revoked, revoked, not
-		o.sign("caB", u, "x", 5), o.sign("caB", u, "x", 6), o.sign("caB", u, "x", 7), // B: none of A's business
-		caB, u,
+	cases := []struct {
+		file      string
+		wantMerge bool
+		why       string
+	}{
+		{o.sign("caA", w, "x", 1), true, "A's serial 1"},
+		{o.sign("caA", w, "alice", 0), true, "A's key ID alice"},
+		{o.sign("caA", w, "x", 6), true, "any CA's serial 6, re-scoped to A"},
+		{o.sign("caA", u, "x", 2), true, "A's certificate for u, revoked by fingerprint"},
+		{o.sign("caA", v, "x", 3), true, "A's certificate for v, revoked outright"},
+		{o.sign("caA", w, "x", 2), false, "A's serial 2 of w: nobody revokes it"},
+		{o.sign("caB", w, "x", 5), false, "B's serial 5: A's list may not say"},
+		{o.sign("caB", w, "x", 6), false, "B's serial 6: any-CA is A's only here"},
+		{o.sign("caB", w, "x", 7), false, "B's certificate: A revoked B's key, which is dropped"},
+		{caB, false, "B's key itself"},
 	}
-	want := map[string][]bool{
-		"MergeCA": {true, true, false, false, false, false, false, false},
-		// The control: every certificate here is of key u, which the list
-		// revokes by fingerprint, and B's key is revoked outright.
-		"Merge": {true, true, true, true, true, true, true, true},
+	var files []string
+	for _, c := range cases {
+		files = append(files, c.file)
 	}
-	for name, merge := range map[string]func(*Builder) int{
-		"MergeCA": func(b *Builder) int { return b.MergeCA(k, o.pub(caA)) },
-		"Merge":   func(b *Builder) int { b.Merge(k); return 0 },
-	} {
+	b := NewBuilder(1, "")
+	dropped := b.MergeCA(k, o.pub(caA), o.pub(caA), o.pub(caB))
+	data, err := b.Marshal(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.write("m.krl", data)
+	got, ok := o.query("m.krl", files)
+	if !ok {
+		t.Fatal("ssh-keygen refuses the merged list")
+	}
+	for i, c := range cases {
+		if got[i] != c.wantMerge {
+			t.Errorf("%s: revoked after MergeCA = %v, want %v", c.why, got[i], c.wantMerge)
+		}
+	}
+	// B's section, B's key by blob and by SHA1.
+	if dropped != 3 {
+		t.Errorf("dropped %d, want 3", dropped)
+	}
+	o.judge("m.krl", files)
+}
+
+// The security audit's proof, kept: a CA revoking a user key it certified,
+// or its own key, the ssh-keygen way. Merged for that CA, each revokes what
+// it revoked in the CA's own list. v0.3.0 dropped both.
+func TestOracleMergeCAKeepsACAsOwnKeyRevocations(t *testing.T) {
+	o := newOracle(t)
+	caA := o.keygen("caA", "-t", "ed25519")
+	u := o.keygen("u", "-t", "ed25519")
+	v := o.keygen("v", "-t", "ed25519")
+	o.write("spec1", []byte("key: "+string(o.read(u))))
+	o.mustRun("-k", "-f", "a1.krl", "-s", caA, "spec1")
+	o.write("spec2", o.read(caA)) // a bare key line: the CA's own key revoked
+	o.mustRun("-k", "-f", "a2.krl", "spec2")
+	certU := o.sign("caA", u, "u", 7)
+	certV := o.sign("caA", v, "v", 8)
+	for _, name := range []string{"a1.krl", "a2.krl"} {
+		k, err := Parse(o.read(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		own, ok := o.query(name, []string{certU, certV})
+		if !ok {
+			t.Fatal(name)
+		}
 		b := NewBuilder(1, "")
-		dropped := merge(b)
+		b.MergeCA(k, o.pub(caA))
 		data, err := b.Marshal(time.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
-		o.write(name+".krl", data)
-		got, ok := o.query(name+".krl", files)
-		if !ok {
-			t.Fatalf("%s: ssh-keygen refuses the list", name)
+		o.write("m-"+name, data)
+		got, _ := o.query("m-"+name, []string{certU, certV})
+		if fmt.Sprint(got) != fmt.Sprint(own) {
+			t.Errorf("%s: A's own list revokes %v, merged for A: %v", name, own, got)
 		}
-		if fmt.Sprint(got) != fmt.Sprint(want[name]) {
-			t.Errorf("%s: ssh-keygen -Q says %v, want %v", name, got, want[name])
-		}
-		if name == "MergeCA" && dropped != 4 {
-			t.Errorf("MergeCA dropped %d, want 4 (B's section, any-CA's, a key, a fingerprint)", dropped)
-		}
-		o.judge(name+".krl", files)
 	}
 }
 
@@ -262,6 +307,9 @@ func TestMergeCARefusals(t *testing.T) {
 	k, _ := Parse(func() []byte { d, _ := NewBuilder(1, "").Marshal(time.Now()); return d }())
 	if n := b.MergeCA(k, nil); n != 0 {
 		t.Error(n)
+	}
+	if n := b.MergeCA(k, ca.signer.PublicKey(), nil); n != 0 {
+		t.Errorf("a nil among the other CAs: dropped %d", n)
 	}
 	b.MergeCA(k, ca.cert(t, 1, "x"))
 	if _, err := b.Marshal(time.Now()); err == nil {
