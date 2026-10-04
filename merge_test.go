@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // Three lists written by ssh-keygen -k, merged: the merged list revokes,
@@ -314,5 +316,100 @@ func TestMergeCARefusals(t *testing.T) {
 	b.MergeCA(k, ca.cert(t, 1, "x"))
 	if _, err := b.Marshal(time.Now()); err == nil {
 		t.Error("a certificate as the CA: no error")
+	}
+}
+
+// DropKeys: one CA's list, merged for it, may not lock out a user another
+// CA certified by naming that user's public key -- sshd checks a
+// certificate's own key against the list whoever signed it. Its own key,
+// which reaches only its own certificates, stays revoked; so do its serials.
+// The control is MergeCA on the same list, which keeps the user key.
+func TestMergeCAWithDropKeysKeepsOnlyTheCAsOwnKey(t *testing.T) {
+	caA, caB, u := testKey(t, 1), testKey(t, 2), testKey(t, 3).PublicKey()
+	src := NewBuilder(1, "")
+	src.RevokeKey(u) // a user key: reaches B's certificate for u
+	src.RevokeSerial(caA.PublicKey(), 9)
+	data, err := src.Marshal(time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := func(opt MergeOptions) (*KRL, int) {
+		b := NewBuilder(1, "")
+		n := b.MergeCAWith(k, caA.PublicKey(), opt)
+		out, err := b.Marshal(time.Unix(1, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := Parse(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m, n
+	}
+	bCert := testCert(t, caB, u, 5, "u")
+	aCert := testCert(t, caA, testKey(t, 4).PublicKey(), 9, "w")
+	if m, n := merged(MergeOptions{Others: []ssh.PublicKey{caB.PublicKey()}}); !m.IsRevoked(bCert) || n != 0 {
+		t.Fatalf("control: without DropKeys, the user key is kept (revoked %v, dropped %d)", m.IsRevoked(bCert), n)
+	}
+	m, n := merged(MergeOptions{Others: []ssh.PublicKey{caB.PublicKey()}, DropKeys: true})
+	if m.IsRevoked(bCert) || m.IsRevoked(u) {
+		t.Error("DropKeys: A's list still locks out B's user by naming the user's key")
+	}
+	if !m.IsRevoked(aCert) {
+		t.Error("DropKeys: A's own serial 9 was lost")
+	}
+	if n != 1 {
+		t.Errorf("dropped %d, want 1 (the user key)", n)
+	}
+	// A revoking its own key keeps doing so: it reaches only A's users.
+	own := NewBuilder(1, "")
+	own.RevokeKey(caA.PublicKey())
+	data, _ = own.Marshal(time.Unix(1, 0))
+	k, _ = Parse(data)
+	if m, n := merged(MergeOptions{DropKeys: true}); !m.IsRevoked(aCert) || n != 0 {
+		t.Errorf("DropKeys: A's own key revoked: A's certificate revoked %v, dropped %d", m.IsRevoked(aCert), n)
+	}
+}
+
+// The same, judged by ssh-keygen, with the fingerprint forms it writes: a
+// user key named by blob, SHA1 and SHA256 is left out; the CA's own key,
+// by each form, is kept.
+func TestOracleMergeCAWithDropKeys(t *testing.T) {
+	o := newOracle(t)
+	caA := o.keygen("caA", "-t", "ed25519")
+	caB := o.keygen("caB", "-t", "ed25519")
+	u1 := o.keygen("u1", "-t", "ed25519")
+	u2 := o.keygen("u2", "-t", "ed25519")
+	u3 := o.keygen("u3", "-t", "ed25519")
+	w := o.keygen("w", "-t", "ed25519")
+	certs := []string{o.sign("caB", u1, "x", 1), o.sign("caB", u2, "x", 2), o.sign("caB", u3, "x", 3), o.sign("caA", w, "x", 4)}
+	for i, form := range []string{"key: ", "sha1: ", "sha256: "} {
+		o.write("users", []byte("key: "+string(o.read(u1))+"sha1: "+string(o.read(u2))+"sha256: "+string(o.read(u3))))
+		name := fmt.Sprintf("a%d.krl", i)
+		o.mustRun("-k", "-f", name, "users")
+		o.write("own", []byte(form+string(o.read(caA))))
+		o.mustRun("-k", "-u", "-f", name, "own")
+		k, err := Parse(o.read(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := NewBuilder(1, "")
+		dropped := b.MergeCAWith(k, o.pub(caA), MergeOptions{Others: []ssh.PublicKey{o.pub(caB)}, DropKeys: true})
+		data, err := b.Marshal(time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.write("m-"+name, data)
+		got, ok := o.query("m-"+name, certs)
+		if !ok {
+			t.Fatal("ssh-keygen refuses the merged list")
+		}
+		if want := "[false false false true]"; fmt.Sprint(got) != want || dropped != 3 {
+			t.Errorf("%sCA A: revoked %v (want %s: B's users kept, A's own key revoked), dropped %d (want 3)", form, got, want, dropped)
+		}
 	}
 }

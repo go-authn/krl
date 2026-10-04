@@ -93,8 +93,17 @@ distributor merging several CAs' lists into one needs it:
 - **Left out, and counted:** sections for another CA, and keys or fingerprints
   that designate one of `others`, the other CAs the merged list serves.
 
-So each list keeps its full effect on its own CA, and none can lock another
-CA's users out. v0.3.0 also dropped explicit keys, fingerprints and any-CA
+So each list keeps its full effect on its own CA, and none can revoke another
+CA or its serials. One thing a single KRL cannot scope to a CA is a revoked
+**user key**: sshd checks a certificate's own public key against the list,
+whoever signed the certificate. A list that names the key of a user another CA
+certified therefore locks that user out under every CA of the merged file.
+`Builder.MergeCAWith(k, ca, krl.MergeOptions{Others: others, DropKeys: true})`
+leaves out every explicit key and fingerprint except `ca`'s own key, which
+reaches only `ca`'s certificates. A distributor uses it for a list it does not
+trust with every CA's users (`TestMergeCAWithDropKeysKeepsOnlyTheCAsOwnKey`,
+`TestOracleMergeCAWithDropKeys`). `MergeCA(k, ca, others...)` is unchanged:
+it is `MergeCAWith` with `Others` alone. v0.3.0 also dropped explicit keys, fingerprints and any-CA
 sections: a CA revoking a compromised user key, or itself, revoked nothing
 once merged. A security audit found it; ssh-keygen now judges both cases
 (`TestOracleMergeCA`, `TestOracleMergeCAKeepsACAsOwnKeyRevocations`).
